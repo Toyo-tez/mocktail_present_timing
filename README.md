@@ -1,3 +1,8 @@
+# Fork Info
+This fork implements the VK_EXT_present_timing vulkan extension for frame pacing, it's enabled trough MOCKTAIL_LOW_LATENCY_PRESENT=1, this solution is vibe coded slop
+
+
+
 # Mocktail
 
 [![CI](https://github.com/komaruworld/mocktail/actions/workflows/ci.yml/badge.svg)](https://github.com/komaruworld/mocktail/actions/workflows/ci.yml)
