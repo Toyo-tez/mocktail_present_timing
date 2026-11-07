@@ -11,8 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -137,6 +140,17 @@ using NoteVulkanCallEndFn = void (*)(std::uint64_t, std::int32_t);
 using NoteSurfaceOutOfDateFn = void (*)();
 using WindowDimensionFn = int (*)();
 
+// Tracks past-presentation timing for a single swapchain. Used to estimate the
+// v-blank interval and align host presents just before the next v-blank for
+// low-latency, VRR-friendly pacing (MOCKTAIL_LOW_LATENCY_PRESENT=1).
+struct PresentTimingState {
+  std::deque<std::uint64_t> display_times_ns;  // recent actual display times
+  std::uint64_t refresh_duration_ns = 0;       // estimated v-blank interval
+  std::uint64_t last_display_time_ns = 0;      // most recent display time
+  std::uint64_t last_present_id = 0;           // last present ID observed
+  bool timing_available = false;               // host supports present timing
+};
+
 struct AdapterState {
   struct DeviceDispatch {
     VkDevice device = VK_NULL_HANDLE;
@@ -162,6 +176,9 @@ struct AdapterState {
     PFN_vkBeginCommandBuffer begin_command_buffer = nullptr;
     PFN_vkEndCommandBuffer end_command_buffer = nullptr;
     PFN_vkResetCommandBuffer reset_command_buffer = nullptr;
+    PFN_vkGetPastPresentationTimingEXT get_past_presentation_timing = nullptr;
+    PFN_vkSetSwapchainPresentTimingQueueSizeEXT
+        set_swapchain_present_timing_queue_size = nullptr;
   };
 
   struct QueueBinding {
@@ -200,6 +217,7 @@ struct AdapterState {
   bool extent_translation_logged = false;
   bool present_policy_logged = false;
   bool initialized = false;
+  std::unordered_map<VkSwapchainKHR, PresentTimingState> swapchain_present_timing;
 };
 
 static std::atomic<bool> g_vulkan_call_observation_active{false};
@@ -492,6 +510,13 @@ void RegisterHostDeviceDispatch(VkDevice device,
       get_device_proc_addr(device, "vkEndCommandBuffer"));
   dispatch.reset_command_buffer = reinterpret_cast<PFN_vkResetCommandBuffer>(
       get_device_proc_addr(device, "vkResetCommandBuffer"));
+  dispatch.get_past_presentation_timing =
+      reinterpret_cast<PFN_vkGetPastPresentationTimingEXT>(
+          get_device_proc_addr(device, "vkGetPastPresentationTimingEXT"));
+  dispatch.set_swapchain_present_timing_queue_size =
+      reinterpret_cast<PFN_vkSetSwapchainPresentTimingQueueSizeEXT>(
+          get_device_proc_addr(device,
+                               "vkSetSwapchainPresentTimingQueueSizeEXT"));
 
   AdapterState& state = State();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -1025,6 +1050,128 @@ bool FpsTraceEnabled() {
   return enabled;
 }
 
+bool LowLatencyPresentEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MOCKTAIL_LOW_LATENCY_PRESENT");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+std::uint64_t MonotonicNanos();
+
+// How far before the expected v-blank we submit the present. Submitting too
+// early adds buffering latency; submitting too late risks missing the v-blank.
+constexpr std::uint64_t kPresentSubmitAheadNs = 1500000ULL;  // 1.5 ms
+
+// Returns a copy of the swapchain's present-timing state under the adapter
+// lock. Callers that need to mutate the state should do so under state.mutex.
+PresentTimingState GetSwapchainTimingStateCopy(VkSwapchainKHR swapchain) {
+  AdapterState& state = State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  auto it = state.swapchain_present_timing.find(swapchain);
+  if (it == state.swapchain_present_timing.end()) {
+    return PresentTimingState{};
+  }
+  return it->second;
+}
+
+// Reads back past presentation timing for a swapchain and updates our
+// v-blank interval estimate from the actual display time reported by the host.
+void UpdatePastPresentationTiming(VkDevice device,
+                                  VkSwapchainKHR swapchain) {
+  const AdapterState::DeviceDispatch& dispatch =
+      HostDispatchForDevice(device);
+  if (dispatch.get_past_presentation_timing == nullptr ||
+      swapchain == VK_NULL_HANDLE) {
+    return;
+  }
+  VkPastPresentationTimingInfoEXT info{};
+  info.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT;
+  info.swapchain = swapchain;
+  VkPastPresentationTimingPropertiesEXT props{};
+  props.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT;
+  // Query with a single timing slot; we only need the most recent one.
+  VkPastPresentationTimingEXT timing{};
+  timing.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+  props.pPresentationTimings = &timing;
+  props.presentationTimingCount = 1;
+
+  VkResult result = dispatch.get_past_presentation_timing(
+      device, &info, &props);
+  if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+    return;
+  }
+  if (props.presentationTimingCount == 0) {
+    return;
+  }
+
+  PresentTimingState timing_state;
+  {
+    AdapterState& state = State();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    timing_state.timing_available = true;
+    timing_state.last_present_id = timing.presentId;
+    timing_state.last_display_time_ns = timing.targetTime;
+    auto& entry = state.swapchain_present_timing[swapchain];
+    entry.display_times_ns.push_back(timing.targetTime);
+    while (entry.display_times_ns.size() > 8) {
+      entry.display_times_ns.pop_front();
+    }
+    timing_state = entry;
+  }
+
+  // Estimate the v-blank interval from consecutive display times.
+  if (timing_state.display_times_ns.size() >= 2) {
+    std::uint64_t total_gap = 0;
+    std::uint32_t gaps = 0;
+    auto previous = timing_state.display_times_ns.begin();
+    for (auto it = std::next(previous);
+         it != timing_state.display_times_ns.end(); ++it, ++previous) {
+      if (*it > *previous) {
+        total_gap += *it - *previous;
+        ++gaps;
+      }
+    }
+    if (gaps != 0) {
+      std::uint64_t refresh_duration = total_gap / gaps;
+      AdapterState& state = State();
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.swapchain_present_timing[swapchain].refresh_duration_ns =
+          refresh_duration;
+    }
+  }
+}
+
+// Delays the calling thread just before the next expected v-blank so the
+// host present is submitted as late as possible without missing it. This
+// mirrors dxvk_low_latency's "just-in-time" submission and reduces
+// present-side buffering latency, especially with VRR.
+void ThrottleBeforePresent(VkSwapchainKHR swapchain) {
+  const PresentTimingState timing_state = GetSwapchainTimingStateCopy(swapchain);
+  if (!timing_state.timing_available ||
+      timing_state.refresh_duration_ns == 0 ||
+      timing_state.last_display_time_ns == 0) {
+    return;
+  }
+  const std::uint64_t now = MonotonicNanos();
+  const std::uint64_t interval = timing_state.refresh_duration_ns;
+  // How far into the current v-blank cycle we are.
+  const std::uint64_t cycle_position =
+      (now - timing_state.last_display_time_ns) % interval;
+  // Time until the next v-blank.
+  const std::uint64_t time_until_vblank =
+      (cycle_position == 0) ? interval : (interval - cycle_position);
+  // Submit just ahead of the v-blank.
+  if (time_until_vblank > kPresentSubmitAheadNs) {
+    const std::uint64_t sleep_until =
+        now + (time_until_vblank - kPresentSubmitAheadNs);
+    std::this_thread::sleep_until(
+        std::chrono::time_point<std::chrono::steady_clock>(
+            std::chrono::nanoseconds(sleep_until)));
+  }
+}
+
 std::uint64_t MonotonicNanos() {
   timespec ts{};
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -1457,6 +1604,69 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   }
 
   VkDeviceCreateInfo host_info = *create_info;
+  // Auto-enable VK_EXT_present_timing when the host supports it so Mocktail
+  // can read back actual presentation times for low-latency pacing.
+  std::vector<const char*> device_extension_names;
+  device_extension_names.reserve(create_info->enabledExtensionCount);
+  bool present_timing_enabled = false;
+  for (std::uint32_t i = 0; i < create_info->enabledExtensionCount; ++i) {
+    const char* name = create_info->ppEnabledExtensionNames != nullptr
+                             ? create_info->ppEnabledExtensionNames[i]
+                             : nullptr;
+    if (name == nullptr) {
+      return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    device_extension_names.push_back(name);
+    if (std::strcmp(name, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0) {
+      present_timing_enabled = true;
+    }
+  }
+  if (!present_timing_enabled) {
+    const auto host_enumerate_device_ext =
+        reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            HostInstanceProc(instance, "vkEnumerateDeviceExtensionProperties"));
+    if (host_enumerate_device_ext != nullptr) {
+      std::uint32_t ext_count = 0;
+      VkResult enum_result = host_enumerate_device_ext(
+          physical_device, nullptr, &ext_count, nullptr);
+      if (enum_result == VK_SUCCESS && ext_count != 0) {
+        std::vector<VkExtensionProperties> host_exts(ext_count);
+        enum_result = host_enumerate_device_ext(
+            physical_device, nullptr, &ext_count, host_exts.data());
+        if (enum_result == VK_SUCCESS || enum_result == VK_INCOMPLETE) {
+          host_exts.resize(ext_count);
+          for (const auto& ext : host_exts) {
+            if (std::strcmp(ext.extensionName,
+                            VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0) {
+              present_timing_enabled = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (present_timing_enabled) {
+    bool already_present = false;
+    for (const char* name : device_extension_names) {
+      if (std::strcmp(name, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0) {
+        already_present = true;
+        break;
+      }
+    }
+    if (!already_present) {
+      device_extension_names.push_back(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+    }
+    host_info.enabledExtensionCount =
+        static_cast<std::uint32_t>(device_extension_names.size());
+    host_info.ppEnabledExtensionNames = device_extension_names.data();
+    static std::atomic<bool> present_timing_device_logged{false};
+    if (!present_timing_device_logged.exchange(true, std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "  [vulkan] low_latency_present: enabled VK_EXT_present_timing "
+                   "at vkCreateDevice\n");
+    }
+  }
   EnabledDeviceFeatures enabled = InspectEnabledFeatures(*create_info);
   const bool etc2_emulated = State().etc2.PhysicalDeviceNeedsEmulation(
       physical_device, reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
@@ -1646,6 +1856,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(
       mocktail::graphics::CachedPresentModePolicy();
   const auto explicit_mode = mocktail::graphics::ExplicitPresentMode(present_policy);
   auto image_count_policy = present_policy;
+  const bool low_latency = LowLatencyPresentEnabled();
   if (present_policy != mocktail::graphics::PresentModePolicy::kHostDefault) {
     bool mode_selected = false;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR host_caps = nullptr;
@@ -1727,6 +1938,22 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(
   if (result != VK_SUCCESS) {
     return result;
   }
+  if (low_latency) {
+    host_info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+    static std::atomic<bool> present_timing_swapchain_logged{false};
+    if (!present_timing_swapchain_logged.exchange(true,
+                                                   std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "  [vulkan] low_latency_present: forcing "
+                   "VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT\n");
+    }
+    const auto set_queue_size =
+        HostDispatchForDevice(device).set_swapchain_present_timing_queue_size;
+    if (set_queue_size != nullptr) {
+      (void)set_queue_size(device, *swapchain, 8);
+    }
+  }
+
   const auto host_get_images = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(
       HostDeviceProc(device, "vkGetSwapchainImagesKHR"));
   std::uint32_t image_count = 0;
@@ -2237,6 +2464,19 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
     observation.SetResult(VK_ERROR_INITIALIZATION_FAILED);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
+
+  // Low-latency pacing: when VK_EXT_present_timing is active, delay submission
+  // of this present until just ahead of the next expected v-blank. This avoids
+  // extra present-side buffering latency (like dxvk_low_latency) and works well
+  // with VRR.
+  if (LowLatencyPresentEnabled() && present_info != nullptr &&
+      present_info->swapchainCount != 0 && present_info->pSwapchains != nullptr) {
+    for (std::uint32_t index = 0; index < present_info->swapchainCount;
+         ++index) {
+      ThrottleBeforePresent(present_info->pSwapchains[index]);
+    }
+  }
+
   const VkResult result = state.text_overlay.QueuePresent(
       queue, present_info, ObservedHostQueuePresent);
   const VkResult normalized_result = NormalizeSwapchainResult(result);
@@ -2249,6 +2489,29 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* present_info) {
   }
   if (normalized_result == VK_SUCCESS && note_present != nullptr) {
     note_present();
+  }
+  if (normalized_result == VK_SUCCESS && LowLatencyPresentEnabled() &&
+      present_info != nullptr && present_info->swapchainCount != 0 &&
+      present_info->pSwapchains != nullptr) {
+    VkDevice device = VK_NULL_HANDLE;
+    {
+      AdapterState& state = State();
+      std::lock_guard<std::mutex> lock(state.mutex);
+      const auto binding =
+          std::find_if(state.queue_bindings.begin(), state.queue_bindings.end(),
+                       [queue](const AdapterState::QueueBinding& candidate) {
+                         return candidate.queue == queue;
+                       });
+      if (binding != state.queue_bindings.end()) {
+        device = binding->device;
+      }
+    }
+    if (device != VK_NULL_HANDLE) {
+      for (std::uint32_t index = 0; index < present_info->swapchainCount;
+           ++index) {
+        UpdatePastPresentationTiming(device, present_info->pSwapchains[index]);
+      }
+    }
   }
   if (present_info != nullptr && present_info->pResults != nullptr) {
     for (std::uint32_t index = 0; index < present_info->swapchainCount;
