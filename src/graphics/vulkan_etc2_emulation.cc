@@ -165,6 +165,7 @@ unsigned DecodeWorkerCount() {
 struct HostDevice {
   VkDevice device = VK_NULL_HANDLE;
   bool emulated = false;
+  bool memory_priority = false;
   VkPhysicalDeviceMemoryProperties memory{};
   PFN_vkCreateImage create_image = nullptr;
   PFN_vkDestroyImage destroy_image = nullptr;
@@ -317,6 +318,13 @@ bool CreateStaging(const HostDevice& dev, VkDeviceSize size, Staging* staging,
   allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   allocate_info.allocationSize = requirements.size;
   allocate_info.memoryTypeIndex = type;
+  VkMemoryPriorityAllocateInfoEXT priority_info{};
+  if (dev.memory_priority) {
+    priority_info.sType =
+        VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+    priority_info.priority = 0.8f;  // High priority for upload staging
+    allocate_info.pNext = &priority_info;
+  }
   void* data = nullptr;
   if (type == UINT32_MAX ||
       dev.allocate_memory(dev.device, &allocate_info, nullptr, &memory) !=
@@ -667,7 +675,7 @@ bool VulkanEtc2Emulation::PhysicalDeviceNeedsEmulation(
 
 void VulkanEtc2Emulation::RegisterDevice(
     VkDevice device, VkPhysicalDevice physical_device, bool emulated,
-    const VkPhysicalDeviceMemoryProperties& memory,
+    bool memory_priority, const VkPhysicalDeviceMemoryProperties& memory,
     PFN_vkGetDeviceProcAddr get_device_proc_addr) {
   static_cast<void>(physical_device);
   if (device == VK_NULL_HANDLE || get_device_proc_addr == nullptr) {
@@ -677,6 +685,7 @@ void VulkanEtc2Emulation::RegisterDevice(
   const auto get = get_device_proc_addr;
   dev->device = device;
   dev->emulated = emulated;
+  dev->memory_priority = memory_priority;
   dev->memory = memory;
   dev->create_image = DeviceProc<PFN_vkCreateImage>(get, device, "vkCreateImage");
   dev->destroy_image =

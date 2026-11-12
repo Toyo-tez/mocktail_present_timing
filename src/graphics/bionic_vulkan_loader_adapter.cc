@@ -902,14 +902,19 @@ struct EnabledDeviceFeatures {
   VkPhysicalDeviceFeatures2 root{};
   VkPhysicalDeviceVulkan11Features vulkan11{};
   VkPhysicalDeviceVulkan12Features vulkan12{};
+  VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority{};
   bool placebo_required = false;
+  bool memory_priority_enabled = false;
 
   EnabledDeviceFeatures() {
     root.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     vulkan11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     vulkan12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    memory_priority.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
     root.pNext = &vulkan11;
     vulkan11.pNext = &vulkan12;
+    vulkan12.pNext = &memory_priority;
   }
 };
 
@@ -1654,6 +1659,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   std::vector<const char*> device_extension_names;
   device_extension_names.reserve(create_info->enabledExtensionCount);
   bool present_timing_enabled = false;
+  bool memory_priority_enabled = false;
   for (std::uint32_t i = 0; i < create_info->enabledExtensionCount; ++i) {
     const char* name = create_info->ppEnabledExtensionNames != nullptr
                              ? create_info->ppEnabledExtensionNames[i]
@@ -1665,8 +1671,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     if (std::strcmp(name, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0) {
       present_timing_enabled = true;
     }
+    if (std::strcmp(name, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0) {
+      memory_priority_enabled = true;
+    }
   }
-  if (!present_timing_enabled) {
+  if (!present_timing_enabled || !memory_priority_enabled) {
     const auto host_enumerate_device_ext =
         reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
             HostInstanceProc(instance, "vkEnumerateDeviceExtensionProperties"));
@@ -1681,10 +1690,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
         if (enum_result == VK_SUCCESS || enum_result == VK_INCOMPLETE) {
           host_exts.resize(ext_count);
           for (const auto& ext : host_exts) {
-            if (std::strcmp(ext.extensionName,
+            if (!present_timing_enabled &&
+                std::strcmp(ext.extensionName,
                             VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0) {
               present_timing_enabled = true;
-              break;
+            }
+            if (!memory_priority_enabled &&
+                std::strcmp(ext.extensionName,
+                            VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0) {
+              memory_priority_enabled = true;
             }
           }
         }
@@ -1702,6 +1716,25 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     if (!already_present) {
       device_extension_names.push_back(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
     }
+  }
+  if (memory_priority_enabled) {
+    bool already_present = false;
+    for (const char* name : device_extension_names) {
+      if (std::strcmp(name, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0) {
+        already_present = true;
+        break;
+      }
+    }
+    if (!already_present) {
+      device_extension_names.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    }
+    static std::atomic<bool> memory_priority_logged{false};
+    if (!memory_priority_logged.exchange(true, std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "  [vulkan] enabled VK_EXT_memory_priority at vkCreateDevice\n");
+    }
+  }
+  if (present_timing_enabled) {
     host_info.enabledExtensionCount =
         static_cast<std::uint32_t>(device_extension_names.size());
     host_info.ppEnabledExtensionNames = device_extension_names.data();
@@ -1713,6 +1746,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     }
   }
   EnabledDeviceFeatures enabled = InspectEnabledFeatures(*create_info);
+  enabled.memory_priority_enabled = memory_priority_enabled;
+  if (memory_priority_enabled) {
+    enabled.memory_priority.memoryPriority = VK_TRUE;
+  }
   const bool etc2_emulated = State().etc2.PhysicalDeviceNeedsEmulation(
       physical_device, reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
                            HostInstanceProc(instance,
@@ -1739,7 +1776,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   }
   enabled.root.pNext = &enabled.vulkan11;
   enabled.vulkan11.pNext = &enabled.vulkan12;
-  enabled.vulkan12.pNext = nullptr;
+  enabled.vulkan12.pNext =
+      memory_priority_enabled ? &enabled.memory_priority : nullptr;
+  enabled.memory_priority.pNext = const_cast<void*>(host_info.pNext);
   VkPhysicalDeviceVulkan12Features injected{};
   injected.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   bool injected_required_features = false;
@@ -1760,7 +1799,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
           supported_vulkan12.hostQueryReset == VK_TRUE) {
         injected.timelineSemaphore = VK_TRUE;
         injected.hostQueryReset = VK_TRUE;
-        injected.pNext = const_cast<void*>(host_info.pNext);
+        injected.pNext = &enabled.root;
         host_info.pNext = &injected;
         enabled.vulkan12.timelineSemaphore = VK_TRUE;
         enabled.vulkan12.hostQueryReset = VK_TRUE;
@@ -1768,6 +1807,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
         injected_required_features = true;
       }
     }
+  }
+  if (!injected_required_features && memory_priority_enabled) {
+    host_info.pNext = &enabled.root;
   }
 
   const VkResult result =
@@ -1803,7 +1845,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     host_memory_properties(physical_device, &memory_properties);
   }
   State().etc2.RegisterDevice(*device, physical_device, etc2_emulated,
-                              memory_properties, host_get_device_proc_addr);
+                              memory_priority_enabled, memory_properties,
+                              host_get_device_proc_addr);
 
   std::uint32_t queue_family_count = 0;
   const auto host_get_queue_families =

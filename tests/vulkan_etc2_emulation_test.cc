@@ -55,7 +55,7 @@ class VulkanEtc2Test : public ::testing::TestWithParam<bool> {
     }
     emulation = std::make_unique<VulkanEtc2Emulation>();
     emulation->RegisterDevice(device, Handle<VkPhysicalDevice>(2), emulated,
-                              memory_properties, GetProc);
+                              false, memory_properties, GetProc);
   }
 
   struct Source {

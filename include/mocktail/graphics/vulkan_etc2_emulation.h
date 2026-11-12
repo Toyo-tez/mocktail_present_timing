@@ -42,7 +42,7 @@ class VulkanEtc2Emulation final {
                                     PFN_vkGetPhysicalDeviceFeatures host);
 
   void RegisterDevice(VkDevice device, VkPhysicalDevice physical_device,
-                      bool emulated,
+                      bool emulated, bool memory_priority,
                       const VkPhysicalDeviceMemoryProperties& memory,
                       PFN_vkGetDeviceProcAddr get_device_proc_addr);
   void DestroyDevice(VkDevice device);
