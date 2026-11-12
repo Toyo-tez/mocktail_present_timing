@@ -903,8 +903,10 @@ struct EnabledDeviceFeatures {
   VkPhysicalDeviceVulkan11Features vulkan11{};
   VkPhysicalDeviceVulkan12Features vulkan12{};
   VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority{};
+  VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library{};
   bool placebo_required = false;
   bool memory_priority_enabled = false;
+  bool graphics_pipeline_library_enabled = false;
 
   EnabledDeviceFeatures() {
     root.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -912,9 +914,12 @@ struct EnabledDeviceFeatures {
     vulkan12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     memory_priority.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+    graphics_pipeline_library.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
     root.pNext = &vulkan11;
     vulkan11.pNext = &vulkan12;
     vulkan12.pNext = &memory_priority;
+    memory_priority.pNext = &graphics_pipeline_library;
   }
 };
 
@@ -1660,6 +1665,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   device_extension_names.reserve(create_info->enabledExtensionCount);
   bool present_timing_enabled = false;
   bool memory_priority_enabled = false;
+  bool graphics_pipeline_library_enabled = false;
   for (std::uint32_t i = 0; i < create_info->enabledExtensionCount; ++i) {
     const char* name = create_info->ppEnabledExtensionNames != nullptr
                              ? create_info->ppEnabledExtensionNames[i]
@@ -1674,8 +1680,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
     if (std::strcmp(name, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0) {
       memory_priority_enabled = true;
     }
+    if (std::strcmp(name, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) == 0) {
+      graphics_pipeline_library_enabled = true;
+    }
   }
-  if (!present_timing_enabled || !memory_priority_enabled) {
+  if (!present_timing_enabled || !memory_priority_enabled ||
+      !graphics_pipeline_library_enabled) {
     const auto host_enumerate_device_ext =
         reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
             HostInstanceProc(instance, "vkEnumerateDeviceExtensionProperties"));
@@ -1699,6 +1709,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
                 std::strcmp(ext.extensionName,
                             VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0) {
               memory_priority_enabled = true;
+            }
+            if (!graphics_pipeline_library_enabled &&
+                std::strcmp(ext.extensionName,
+                            VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) == 0) {
+              graphics_pipeline_library_enabled = true;
             }
           }
         }
@@ -1734,6 +1749,25 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
                    "  [vulkan] enabled VK_EXT_memory_priority at vkCreateDevice\n");
     }
   }
+  if (graphics_pipeline_library_enabled) {
+    bool already_present = false;
+    for (const char* name : device_extension_names) {
+      if (std::strcmp(name, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) == 0) {
+        already_present = true;
+        break;
+      }
+    }
+    if (!already_present) {
+      device_extension_names.push_back(
+          VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
+    static std::atomic<bool> gpl_logged{false};
+    if (!gpl_logged.exchange(true, std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "  [vulkan] enabled VK_EXT_graphics_pipeline_library at "
+                   "vkCreateDevice\n");
+    }
+  }
   if (present_timing_enabled) {
     host_info.enabledExtensionCount =
         static_cast<std::uint32_t>(device_extension_names.size());
@@ -1747,8 +1781,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   }
   EnabledDeviceFeatures enabled = InspectEnabledFeatures(*create_info);
   enabled.memory_priority_enabled = memory_priority_enabled;
+  enabled.graphics_pipeline_library_enabled = graphics_pipeline_library_enabled;
   if (memory_priority_enabled) {
     enabled.memory_priority.memoryPriority = VK_TRUE;
+  }
+  if (graphics_pipeline_library_enabled) {
+    enabled.graphics_pipeline_library.graphicsPipelineLibrary = VK_TRUE;
   }
   const bool etc2_emulated = State().etc2.PhysicalDeviceNeedsEmulation(
       physical_device, reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
@@ -1776,9 +1814,19 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
   }
   enabled.root.pNext = &enabled.vulkan11;
   enabled.vulkan11.pNext = &enabled.vulkan12;
-  enabled.vulkan12.pNext =
-      memory_priority_enabled ? &enabled.memory_priority : nullptr;
-  enabled.memory_priority.pNext = const_cast<void*>(host_info.pNext);
+  if (memory_priority_enabled && graphics_pipeline_library_enabled) {
+    enabled.vulkan12.pNext = &enabled.memory_priority;
+    enabled.memory_priority.pNext = &enabled.graphics_pipeline_library;
+    enabled.graphics_pipeline_library.pNext = const_cast<void*>(host_info.pNext);
+  } else if (memory_priority_enabled) {
+    enabled.vulkan12.pNext = &enabled.memory_priority;
+    enabled.memory_priority.pNext = const_cast<void*>(host_info.pNext);
+  } else if (graphics_pipeline_library_enabled) {
+    enabled.vulkan12.pNext = &enabled.graphics_pipeline_library;
+    enabled.graphics_pipeline_library.pNext = const_cast<void*>(host_info.pNext);
+  } else {
+    enabled.vulkan12.pNext = nullptr;
+  }
   VkPhysicalDeviceVulkan12Features injected{};
   injected.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   bool injected_required_features = false;
@@ -1808,7 +1856,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
       }
     }
   }
-  if (!injected_required_features && memory_priority_enabled) {
+  if (!injected_required_features &&
+      (memory_priority_enabled || graphics_pipeline_library_enabled)) {
     host_info.pNext = &enabled.root;
   }
 
