@@ -230,6 +230,8 @@ struct Staging {
   VkBuffer buffer = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
   bool host_cached = false;
+  VkDeviceSize capacity = 0;  // bytes the allocation can hold
+  std::uint8_t* mapped = nullptr;
 };
 
 struct PendingUpload {
@@ -272,86 +274,6 @@ std::atomic<unsigned> g_failure_logs{0};
 void LogFailure(const char* message) {
   if (ShouldLog(&g_failure_logs, 8)) {
     std::fprintf(stderr, "  [vulkan] ETC2 emulation: %s\n", message);
-  }
-}
-
-bool CreateStaging(const HostDevice& dev, VkDeviceSize size, Staging* staging,
-                   std::uint8_t** mapped) {
-  if (dev.create_buffer == nullptr || dev.allocate_memory == nullptr ||
-      dev.get_buffer_memory_requirements == nullptr ||
-      dev.bind_buffer_memory == nullptr || dev.map_memory == nullptr ||
-      dev.destroy_buffer == nullptr || dev.free_memory == nullptr ||
-      size == 0) {
-    return false;
-  }
-  VkBufferCreateInfo buffer_info{};
-  buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  buffer_info.size = size;
-  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  VkBuffer buffer = VK_NULL_HANDLE;
-  if (dev.create_buffer(dev.device, &buffer_info, nullptr, &buffer) !=
-      VK_SUCCESS) {
-    return false;
-  }
-  VkMemoryRequirements requirements{};
-  dev.get_buffer_memory_requirements(dev.device, buffer, &requirements);
-  constexpr VkMemoryPropertyFlags kRequired =
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  std::uint32_t type = UINT32_MAX;
-  for (std::uint32_t index = 0; index < dev.memory.memoryTypeCount; ++index) {
-    if ((requirements.memoryTypeBits & (1U << index)) != 0 &&
-        (dev.memory.memoryTypes[index].propertyFlags & kRequired) ==
-            kRequired) {
-      if (type == UINT32_MAX) {
-        type = index;
-      }
-      if ((dev.memory.memoryTypes[index].propertyFlags &
-           VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
-        type = index;
-        break;
-      }
-    }
-  }
-  VkDeviceMemory memory = VK_NULL_HANDLE;
-  VkMemoryAllocateInfo allocate_info{};
-  allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  allocate_info.allocationSize = requirements.size;
-  allocate_info.memoryTypeIndex = type;
-  VkMemoryPriorityAllocateInfoEXT priority_info{};
-  if (dev.memory_priority) {
-    priority_info.sType =
-        VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
-    priority_info.priority = 0.8f;  // High priority for upload staging
-    allocate_info.pNext = &priority_info;
-  }
-  void* data = nullptr;
-  if (type == UINT32_MAX ||
-      dev.allocate_memory(dev.device, &allocate_info, nullptr, &memory) !=
-          VK_SUCCESS) {
-    dev.destroy_buffer(dev.device, buffer, nullptr);
-    return false;
-  }
-  if (dev.bind_buffer_memory(dev.device, buffer, memory, 0) != VK_SUCCESS ||
-      dev.map_memory(dev.device, memory, 0, VK_WHOLE_SIZE, 0, &data) !=
-          VK_SUCCESS) {
-    dev.destroy_buffer(dev.device, buffer, nullptr);
-    dev.free_memory(dev.device, memory, nullptr);
-    return false;
-  }
-  *staging = {dev.device, buffer, memory,
-              (dev.memory.memoryTypes[type].propertyFlags &
-               VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0};
-  *mapped = static_cast<std::uint8_t*>(data);
-  return true;
-}
-
-void DestroyStaging(const HostDevice& dev, const Staging& staging) {
-  if (dev.destroy_buffer != nullptr) {
-    dev.destroy_buffer(dev.device, staging.buffer, nullptr);
-  }
-  if (dev.free_memory != nullptr) {
-    dev.free_memory(dev.device, staging.memory, nullptr);
   }
 }
 
@@ -507,6 +429,15 @@ bool PlanRegions(const ImageRecord& record, VkDevice device, VkBuffer source,
 
 }  // namespace
 
+void DestroyStaging(const HostDevice& dev, const Staging& staging) {
+  if (dev.destroy_buffer != nullptr) {
+    dev.destroy_buffer(dev.device, staging.buffer, nullptr);
+  }
+  if (dev.free_memory != nullptr) {
+    dev.free_memory(dev.device, staging.memory, nullptr);
+  }
+}
+
 struct VulkanEtc2Emulation::State {
   std::mutex mutex;
   std::shared_mutex devices_mutex;
@@ -522,6 +453,54 @@ struct VulkanEtc2Emulation::State {
   TextureOverrides overrides = TextureOverrides::FromEnvironment();
   const std::uint32_t upscale =
       SmallTextureUpscale(std::getenv("MOCKTAIL_SMALL_TEXTURE_UPSCALE"));
+
+  // Reusable staging buffer pool keyed by allocation size. Reusing staging
+  // buffers avoids vkCreateBuffer/vkAllocateMemory/vkFreeMemory churn when
+  // textures are repeatedly loaded and unloaded.
+  std::mutex staging_pool_mutex;
+  std::unordered_map<VkDeviceSize, std::vector<Staging>> staging_pool;
+  std::unordered_set<VkDeviceMemory> pooled_memory;
+
+  Staging* AcquireStaging(const HostDevice& dev, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(staging_pool_mutex);
+    auto& bucket = staging_pool[size];
+    while (!bucket.empty()) {
+      Staging* staging = &bucket.back();
+      bucket.pop_back();
+      pooled_memory.erase(staging->memory);
+      if (staging->device == dev.device) {
+        return staging;
+      }
+      // Staging buffer belongs to a different (possibly destroyed) device;
+      // drop it rather than reuse across devices.
+      DestroyStaging(dev, *staging);
+    }
+    return nullptr;
+  }
+
+  void ReleaseStaging(Staging* staging) {
+    if (staging == nullptr || staging->device == VK_NULL_HANDLE) return;
+    std::lock_guard<std::mutex> lock(staging_pool_mutex);
+    auto& bucket = staging_pool[staging->capacity];
+    bucket.push_back(std::move(*staging));
+    pooled_memory.insert(bucket.back().memory);
+  }
+
+  void PurgeDeviceStaging(VkDevice device, const HostDevice* dev) {
+    std::lock_guard<std::mutex> lock(staging_pool_mutex);
+    for (auto& [size, bucket] : staging_pool) {
+      bucket.erase(
+          std::remove_if(bucket.begin(), bucket.end(),
+                         [device, dev](const Staging& staging) {
+                           if (staging.device != device) return false;
+                           if (dev != nullptr) {
+                             DestroyStaging(*dev, staging);
+                           }
+                           return true;
+                         }),
+          bucket.end());
+    }
+  }
 
   std::shared_ptr<const RgbaImage> FindOverride(const PendingUpload& upload,
                                                 const std::uint8_t* compressed,
@@ -648,6 +627,87 @@ struct VulkanEtc2Emulation::State {
   }
 };
 
+bool CreateStaging(const HostDevice& dev, VkDeviceSize size, Staging* staging,
+                   std::uint8_t** mapped, VulkanEtc2Emulation::State* state) {
+  if (dev.create_buffer == nullptr || dev.allocate_memory == nullptr ||
+      dev.get_buffer_memory_requirements == nullptr ||
+      dev.bind_buffer_memory == nullptr || dev.map_memory == nullptr ||
+      dev.destroy_buffer == nullptr || dev.free_memory == nullptr ||
+      size == 0) {
+    return false;
+  }
+  // Try the reusable pool first to avoid allocation churn.
+  if (state != nullptr) {
+    Staging* pooled = state->AcquireStaging(dev, size);
+    if (pooled != nullptr) {
+      *staging = *pooled;
+      *mapped = pooled->mapped;
+      return true;
+    }
+  }
+  VkBufferCreateInfo buffer_info{};
+  buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_info.size = size;
+  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  if (dev.create_buffer(dev.device, &buffer_info, nullptr, &buffer) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements requirements{};
+  dev.get_buffer_memory_requirements(dev.device, buffer, &requirements);
+  constexpr VkMemoryPropertyFlags kRequired =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  std::uint32_t type = UINT32_MAX;
+  for (std::uint32_t index = 0; index < dev.memory.memoryTypeCount; ++index) {
+    if ((requirements.memoryTypeBits & (1U << index)) != 0 &&
+        (dev.memory.memoryTypes[index].propertyFlags & kRequired) ==
+            kRequired) {
+      if (type == UINT32_MAX) {
+        type = index;
+      }
+      if ((dev.memory.memoryTypes[index].propertyFlags &
+           VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
+        type = index;
+        break;
+      }
+    }
+  }
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkMemoryAllocateInfo allocate_info{};
+  allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocate_info.allocationSize = requirements.size;
+  allocate_info.memoryTypeIndex = type;
+  VkMemoryPriorityAllocateInfoEXT priority_info{};
+  if (dev.memory_priority) {
+    priority_info.sType =
+        VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+    priority_info.priority = 0.8f;  // High priority for upload staging
+    allocate_info.pNext = &priority_info;
+  }
+  void* data = nullptr;
+  if (type == UINT32_MAX ||
+      dev.allocate_memory(dev.device, &allocate_info, nullptr, &memory) !=
+          VK_SUCCESS) {
+    dev.destroy_buffer(dev.device, buffer, nullptr);
+    return false;
+  }
+  if (dev.bind_buffer_memory(dev.device, buffer, memory, 0) != VK_SUCCESS ||
+      dev.map_memory(dev.device, memory, 0, VK_WHOLE_SIZE, 0, &data) !=
+          VK_SUCCESS) {
+    dev.destroy_buffer(dev.device, buffer, nullptr);
+    dev.free_memory(dev.device, memory, nullptr);
+    return false;
+  }
+  *staging = {dev.device, buffer, memory,
+              (dev.memory.memoryTypes[type].propertyFlags &
+               VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0,
+              requirements.size, static_cast<std::uint8_t*>(data)};
+  *mapped = static_cast<std::uint8_t*>(data);
+  return true;
+}
+
 VulkanEtc2Emulation::VulkanEtc2Emulation() : state_(new State) {}
 
 VulkanEtc2Emulation::~VulkanEtc2Emulation() { delete state_; }
@@ -767,6 +827,9 @@ void VulkanEtc2Emulation::DestroyDevice(VkDevice device) {
     for (const Staging& staging : doomed) {
       DestroyStaging(*dev, staging);
     }
+    // Drop any pooled staging buffers that belong to this device so they
+    // cannot be reused after the device is destroyed.
+    state_->PurgeDeviceStaging(device, dev);
   }
   std::lock_guard<std::shared_mutex> lock(state_->devices_mutex);
   state_->devices.erase(
@@ -1008,7 +1071,7 @@ void VulkanEtc2Emulation::CmdCopyBufferToImage(
     LogFailure("skipped an upload with an unsupported region");
     return;
   }
-  if (!CreateStaging(*dev, total, &staging, &mapped)) {
+  if (!CreateStaging(*dev, total, &staging, &mapped, state_)) {
     LogFailure("could not allocate a host-visible staging buffer");
     return;
   }
@@ -1045,7 +1108,7 @@ void VulkanEtc2Emulation::CmdCopyBufferToImage2(
     LogFailure("skipped an upload with an unsupported region");
     return;
   }
-  if (!CreateStaging(*dev, total, &staging, &mapped)) {
+  if (!CreateStaging(*dev, total, &staging, &mapped, state_)) {
     LogFailure("could not allocate a host-visible staging buffer");
     return;
   }
@@ -1388,10 +1451,8 @@ void VulkanEtc2Emulation::ReleaseCommandBuffer(VkCommandBuffer command_buffer) {
     state_->has_commands.store(!state_->commands.empty(),
                                std::memory_order_release);
   }
-  for (const Staging& staging : doomed) {
-    if (const HostDevice* dev = state_->Find(staging.device); dev != nullptr) {
-      DestroyStaging(*dev, staging);
-    }
+  for (Staging& staging : doomed) {
+    state_->ReleaseStaging(&staging);
   }
 }
 
