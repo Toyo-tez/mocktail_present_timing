@@ -1924,11 +1924,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(
       return selected;
     }
   }
-  const VkResult result =
-      host_create(device, &host_info, allocator, swapchain);
-  if (result != VK_SUCCESS) {
-    return result;
-  }
+  // Enable VK_EXT_present_timing on the swapchain before creating it so the
+  // host actually records presentation timing for our low-latency pacing.
   if (low_latency) {
     host_info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
     static std::atomic<bool> present_timing_swapchain_logged{false};
@@ -1938,6 +1935,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(
                    "  [vulkan] low_latency_present: forcing "
                    "VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT\n");
     }
+  }
+  const VkResult result =
+      host_create(device, &host_info, allocator, swapchain);
+  if (result != VK_SUCCESS) {
+    return result;
+  }
+  if (low_latency) {
     const auto set_queue_size =
         HostDispatchForDevice(device).set_swapchain_present_timing_queue_size;
     if (set_queue_size != nullptr) {
